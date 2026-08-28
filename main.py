@@ -8,6 +8,7 @@ import os
 import uvicorn
 import base64
 import json
+import bcrypt
 from supabase import create_client, Client
 
 # ==========================================
@@ -237,6 +238,166 @@ async def submit_feedback(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={"status": "error", "message": f"เกิดข้อผิดพลาดภายในเซิร์ฟเวอร์: {str(e)}"}
         )
+
+@app.post("/api/v1/register")
+async def register_user(
+    full_name: str = Form(...),
+    email: str = Form(...),
+    password: str = Form(...)
+):
+    email = email.strip().lower()
+
+    # 1. เช็คความยาวรหัสผ่าน (ต้อง 8 ตัวขึ้นไป)
+    if len(password) < 8:
+        return JSONResponse(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            content={"status": "error", "message": "รหัสผ่านต้องมีอย่างน้อย 8 ตัวอักษร"}
+        )
+
+    try:
+        # 2. เช็คว่ามีอีเมลนี้ในระบบหรือยัง
+        res = supabase.table("users").select("id").eq("email", email).execute()
+        if res.data and len(res.data) > 0:
+            return JSONResponse(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                content={"status": "error", "message": "อีเมลนี้ถูกใช้งานแล้ว"}
+            )
+
+        # 3. เข้ารหัสผ่านให้ปลอดภัยก่อนลง Database
+        hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+
+        # 4. บันทึกข้อมูลลงตาราง users
+        new_user = {
+            "full_name": full_name,
+            "email": email,
+            "password_hash": hashed_password,
+            "role": "user"
+        }
+        supabase.table("users").insert(new_user).execute()
+        
+        return {"status": "success", "message": "สมัครสมาชิกสำเร็จ"}
+
+    except Exception as e:
+        print(f"Register Error: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": "ไม่สามารถสมัครสมาชิกได้ในขณะนี้"}
+        )
+
+@app.post("/api/v1/login")
+async def login_user(
+    email: str = Form(...),
+    password: str = Form(...)
+):
+    email = email.strip().lower()
+
+    try:
+        # 1. ค้นหาผู้ใช้จากอีเมลใน Supabase
+        res = supabase.table("users").select("*").eq("email", email).execute()
+        
+        if not res.data or len(res.data) == 0:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"status": "error", "message": "อีเมลหรือรหัสผ่านไม่ถูกต้อง"}
+            )
+
+        user = res.data[0]
+        stored_password = user.get("password_hash", "") or user.get("password", "")
+
+        # 2. เช็ครหัสผ่าน (รองรับทั้งแบบข้อความธรรมดา หรือเช็คผ่าน bcrypt)
+        is_matched = False
+        try:
+            if stored_password.startswith("$2b$") or stored_password.startswith("$2a$"):
+                is_matched = bcrypt.checkpw(password.encode('utf-8'), stored_password.encode('utf-8'))
+            else:
+                is_matched = (password == stored_password)
+        except Exception:
+            is_matched = (password == stored_password)
+
+        if not is_matched:
+            return JSONResponse(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                content={"status": "error", "message": "อีเมลหรือรหัสผ่านไม่ถูกต้อง"}
+            )
+
+        # 3. ล็อกอินสำเร็จ ส่งข้อมูลกลับไปให้ Flutter
+        return {
+            "status": "success",
+            "user_id": str(user["id"]),
+            "user_name": user["full_name"]
+        }
+
+    except Exception as e:
+        print(f"❌ Login Error Details: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": f"Server Error: {str(e)}"}
+        )
+
+@app.post("/api/v1/update_profile")
+async def update_profile(
+    user_id: str = Form(...),
+    full_name: str = Form(...)
+):
+    try:
+        supabase.table("users").update({"full_name": full_name}).eq("id", user_id).execute()
+        return {"status": "success", "message": "บันทึกข้อมูลส่วนตัวเรียบร้อยแล้ว"}
+    except Exception as e:
+        print(f"Update Profile Error: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": "ไม่สามารถอัปเดตข้อมูลได้"}
+        )
+
+@app.post("/api/v1/update_password")
+async def update_password(
+    user_id: str = Form(...),
+    current_password: str = Form(...),
+    new_password: str = Form(...)
+):
+    try:
+        res = supabase.table("users").select("password_hash").eq("id", user_id).execute()
+        if not res.data:
+            return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"status": "error", "message": "ไม่พบผู้ใช้"})
+
+        stored_hash = res.data[0].get("password_hash", "")
+        
+        # เช็ครหัสผ่านเดิม
+        is_matched = False
+        try:
+            if stored_hash.startswith("$2b$") or stored_hash.startswith("$2a$"):
+                is_matched = bcrypt.checkpw(current_password.encode('utf-8'), stored_hash.encode('utf-8'))
+            else:
+                is_matched = (current_password == stored_hash)
+        except:
+            is_matched = (current_password == stored_hash)
+
+        if not is_matched:
+            return JSONResponse(status_code=status.HTTP_401_UNAUTHORIZED, content={"status": "error", "message": "รหัสผ่านเดิมไม่ถูกต้อง"})
+
+        if len(new_password) < 8:
+            return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"status": "error", "message": "รหัสผ่านใหม่ต้องมี 8 ตัวขึ้นไป"})
+
+        # อัปเดตรหัสผ่านใหม่
+        new_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+        supabase.table("users").update({"password_hash": new_hash}).eq("id", user_id).execute()
+
+        return {"status": "success", "message": "เปลี่ยนรหัสผ่านสำเร็จ"}
+    except Exception as e:
+        print(f"Update Password Error: {e}")
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={"status": "error", "message": "ระบบขัดข้อง ไม่สามารถเปลี่ยนรหัสผ่านได้"}
+        )
+        
+@app.get("/api/v1/feedback_history")
+def get_feedback_history():
+    try:
+        response = supabase.table("technician_feedback").select("*").order("submitted_at", desc=True).execute()
+        return {"status": "success", "data": response.data}
+    except Exception as e:
+        print(f"Feedback History Error: {e}")
+        return {"status": "error", "message": str(e)}
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
