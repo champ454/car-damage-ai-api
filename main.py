@@ -10,12 +10,19 @@ import base64
 import json
 import bcrypt
 from supabase import create_client, Client
+from dotenv import load_dotenv # 1. นำเข้า load_dotenv
+
+load_dotenv()
 
 # ==========================================
-# 1. ตั้งค่า Supabase
+# 1. ตั้งค่า Supabase (ดึงจาก .env)
 # ==========================================
-SUPABASE_URL = "https://zkfqqywpluqgvymmvqqr.supabase.co"
-SUPABASE_KEY = "sb_publishable_hYmRXX4MvU0B0b9dF77KKQ_BTICQnjO"
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_KEY = os.getenv("SUPABASE_KEY")
+
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("Missing Supabase URL or Key in .env file")
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="Car Damage Assessment API")
