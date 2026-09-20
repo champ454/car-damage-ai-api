@@ -10,7 +10,7 @@ import base64
 import json
 import bcrypt
 from supabase import create_client, Client
-from dotenv import load_dotenv # 1. นำเข้า load_dotenv
+from dotenv import load_dotenv
 
 load_dotenv()
 
@@ -76,7 +76,11 @@ async def predict_damage(
         needs_human_review = False
         total_cost = 0
 
-        for box in results.boxes:
+        # ตรวจสอบว่ามีข้อมูล Mask จากโมเดล Segmentation หรือไม่
+        has_masks = results.masks is not None
+        masks = results.masks if has_masks else []
+
+        for i, box in enumerate(results.boxes):
             conf = float(box.conf[0])
             class_id = int(box.cls[0])
             
@@ -91,6 +95,35 @@ async def predict_damage(
 
             if conf < CONF_THRESHOLD:
                 needs_human_review = True
+
+            # ==========================================
+            # Rule-based: คำนวณขนาดความเสียหายจาก Mask
+            # ==========================================
+            damage_ratio = 0.0
+            repair_action = "ซ่อมทำสี (Repair)"
+            price_multiplier = 1.0
+
+            if has_masks and i < len(masks):
+                # คำนวณพื้นที่ Bounding Box (พิกเซล)
+                w = float(box.xywh[0][2])
+                h = float(box.xywh[0][3])
+                bbox_area = w * h
+
+                # คำนวณพื้นที่พิกเซลจริงจาก Mask
+                mask_tensor = masks[i].data[0]
+                mask_area = float(mask_tensor.sum())
+
+                # คำนวณสัดส่วนพื้นที่ความเสียหายเทียบกับกรอบ
+                if bbox_area > 0:
+                    damage_ratio = mask_area / bbox_area
+
+                # กำหนดเงื่อนไข: หากรอยแผลกินพื้นที่เกิน 30% ให้ประเมินเป็นการเปลี่ยนชิ้นส่วน
+                if damage_ratio > 0.30:
+                    repair_action = "เปลี่ยนชิ้นส่วน (Replace)"
+                    price_multiplier = 1.5
+                else:
+                    repair_action = "ซ่อมทำสี (Repair)"
+                    price_multiplier = 1.0
 
             subtotal = 0
             matched_query = ""
@@ -107,37 +140,39 @@ async def predict_damage(
                 try:
                     response = supabase.table("parts_pricing").select("price").eq("part_name", query).execute()
                     if response.data and len(response.data) > 0:
-                        subtotal = float(response.data[0]["price"])
+                        subtotal = float(response.data[0]["price"]) * price_multiplier
                         matched_query = query
                         break 
                 except Exception as e:
                     print(f"Database Query Error: {e}")
 
-            # Fallback: ถ้าหาแบบผสมคำไม่เจอ ให้ลองดึงราคาจากชื่อรอยเพียวๆ
+            # Fallback: ถ้าหาแบบผสมคำไม่เจอ ให้ดึงราคาจากชื่อรอยความเสียหายตรงๆ
             if subtotal == 0:
                 try:
                     fallback_res = supabase.table("parts_pricing").select("price").eq("part_name", normalized_damage).execute()
                     if fallback_res.data and len(fallback_res.data) > 0:
-                        subtotal = float(fallback_res.data[0]["price"])
+                        subtotal = float(fallback_res.data[0]["price"]) * price_multiplier
                         matched_query = normalized_damage
-                except:
-                    pass
+                except Exception as e:
+                    print(f"Fallback Query Error: {e}")
 
             total_cost += subtotal
             parts_detected.append({
                 "label": damage_type_original,
                 "confidence": round(conf, 2),
                 "cost": subtotal,
-                "matched_part": matched_query
+                "matched_part": matched_query,
+                "damage_percent": round(damage_ratio * 100, 2),
+                "repair_action": repair_action
             })
 
-        # 2.3 วาดกรอบบนรูปภาพและเข้ารหัสเป็น Base64
+        # 2.3 วาดกรอบและ Mask บนรูปภาพ เข้ารหัสเป็น Base64
         img_with_boxes = results.plot()
         _, buffer = cv2.imencode('.jpg', img_with_boxes)
         img_base64 = base64.b64encode(buffer).decode('utf-8')
         image_data_uri = f"data:image/jpeg;base64,{img_base64}"
 
-        # 2.4 บันทึกข้อมูลลงตาราง inspections แบบแยกตาม user_id
+        # 2.4 บันทึกข้อมูลลงตาราง inspections แยกตาม user_id
         try:
             new_inspection = {
                 "user_id": user_id,
@@ -182,14 +217,12 @@ def get_user_history(user_id: str):
         return {"status": "error", "message": str(e)}
     
 # ==========================================
-# 4. API: ดึงผลลัพธ์การประเมิน 1 รายการ (สำหรับหน้า Result)
+# 4. API: ดึงผลลัพธ์การประเมิน 1 รายการ
 # ==========================================
 @app.get("/api/v1/inspection/{inspection_id}")
 def get_single_inspection(inspection_id: int):
     try:
-        # ค้นหาข้อมูลจาก id ที่ส่งมา
         response = supabase.table("inspections").select("*").eq("id", inspection_id).execute()
-        
         if response.data and len(response.data) > 0:
             return {"status": "success", "data": response.data[0]}
         else:
@@ -197,6 +230,9 @@ def get_single_inspection(inspection_id: int):
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+# ==========================================
+# 5. API: ส่ง Feedback จากช่าง
+# ==========================================
 @app.post("/api/v1/feedback")
 async def submit_feedback(
     case_id: str = Form(...),
@@ -205,7 +241,6 @@ async def submit_feedback(
     notes: str = Form("")
 ):
     try:
-        # 1. จัดการแปลง case_id (เช่น "CASE-14" -> 14)
         clean_case_id = case_id.replace("CASE-", "").strip()
         if not clean_case_id.isdigit():
             return JSONResponse(
@@ -214,7 +249,6 @@ async def submit_feedback(
             )
         inspection_id = int(clean_case_id)
 
-        # 2. แปลงราคาเป็น float
         try:
             price_float = float(corrected_price)
         except ValueError:
@@ -223,7 +257,6 @@ async def submit_feedback(
                 content={"status": "error", "message": "ราคาประเมินต้องเป็นตัวเลขเท่านั้น"}
             )
 
-        # 3. จัดเตรียมข้อมูลให้ตรงกับ Column ใน Supabase
         feedback_data = {
             "case_id": inspection_id,
             "damage_label": damage_type,
@@ -231,7 +264,6 @@ async def submit_feedback(
             "note": notes
         }
         
-        # 4. บันทึกลง Supabase
         supabase.table("technician_feedback").insert(feedback_data).execute()
         
         return JSONResponse(
@@ -246,6 +278,9 @@ async def submit_feedback(
             content={"status": "error", "message": f"เกิดข้อผิดพลาดภายในเซิร์ฟเวอร์: {str(e)}"}
         )
 
+# ==========================================
+# 6. API: การยืนยันตัวตนและการจัดการบัญชี
+# ==========================================
 @app.post("/api/v1/register")
 async def register_user(
     full_name: str = Form(...),
@@ -254,7 +289,6 @@ async def register_user(
 ):
     email = email.strip().lower()
 
-    # 1. เช็คความยาวรหัสผ่าน (ต้อง 8 ตัวขึ้นไป)
     if len(password) < 8:
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -262,7 +296,6 @@ async def register_user(
         )
 
     try:
-        # 2. เช็คว่ามีอีเมลนี้ในระบบหรือยัง
         res = supabase.table("users").select("id").eq("email", email).execute()
         if res.data and len(res.data) > 0:
             return JSONResponse(
@@ -270,10 +303,8 @@ async def register_user(
                 content={"status": "error", "message": "อีเมลนี้ถูกใช้งานแล้ว"}
             )
 
-        # 3. เข้ารหัสผ่านให้ปลอดภัยก่อนลง Database
         hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
 
-        # 4. บันทึกข้อมูลลงตาราง users
         new_user = {
             "full_name": full_name,
             "email": email,
@@ -299,7 +330,6 @@ async def login_user(
     email = email.strip().lower()
 
     try:
-        # 1. ค้นหาผู้ใช้จากอีเมลใน Supabase
         res = supabase.table("users").select("*").eq("email", email).execute()
         
         if not res.data or len(res.data) == 0:
@@ -311,7 +341,6 @@ async def login_user(
         user = res.data[0]
         stored_password = user.get("password_hash", "") or user.get("password", "")
 
-        # 2. เช็ครหัสผ่าน (รองรับทั้งแบบข้อความธรรมดา หรือเช็คผ่าน bcrypt)
         is_matched = False
         try:
             if stored_password.startswith("$2b$") or stored_password.startswith("$2a$"):
@@ -327,7 +356,6 @@ async def login_user(
                 content={"status": "error", "message": "อีเมลหรือรหัสผ่านไม่ถูกต้อง"}
             )
 
-        # 3. ล็อกอินสำเร็จ ส่งข้อมูลกลับไปให้ Flutter
         return {
             "status": "success",
             "user_id": str(user["id"]),
@@ -369,14 +397,13 @@ async def update_password(
 
         stored_hash = res.data[0].get("password_hash", "")
         
-        # เช็ครหัสผ่านเดิม
         is_matched = False
         try:
             if stored_hash.startswith("$2b$") or stored_hash.startswith("$2a$"):
                 is_matched = bcrypt.checkpw(current_password.encode('utf-8'), stored_hash.encode('utf-8'))
             else:
                 is_matched = (current_password == stored_hash)
-        except:
+        except Exception:
             is_matched = (current_password == stored_hash)
 
         if not is_matched:
@@ -385,7 +412,6 @@ async def update_password(
         if len(new_password) < 8:
             return JSONResponse(status_code=status.HTTP_400_BAD_REQUEST, content={"status": "error", "message": "รหัสผ่านใหม่ต้องมี 8 ตัวขึ้นไป"})
 
-        # อัปเดตรหัสผ่านใหม่
         new_hash = bcrypt.hashpw(new_password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
         supabase.table("users").update({"password_hash": new_hash}).eq("id", user_id).execute()
 
