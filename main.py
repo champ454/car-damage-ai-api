@@ -85,7 +85,8 @@ async def predict_damage(
     file: UploadFile = File(...), 
     car_locations: str = Form(...),
     vehicle_id: str = Form(...), 
-    user_id: str = Form(...)     
+    user_id: str = Form(...),
+    car_model: str = Form(...)
 ):
     contents = await file.read()
     detected_type = imghdr.what(None, h=contents)  # ตรวจสอบจาก Byte จริง ไม่ใช่ Header
@@ -133,7 +134,7 @@ async def predict_damage(
 
         # 🟢 Optimization A: Batch Query (In-Memory Pre-fetching)
         try:
-            pricing_res = supabase.table("parts_pricing").select("part_name, price").execute()
+            pricing_res = supabase.table("parts_pricing").select("part_name, price").eq("car_model", car_model).execute()
             pricing_dict = {item["part_name"]: float(item["price"]) for item in pricing_res.data} if pricing_res.data else {}
         except Exception as e:
             logger.error(f"Failed to pre-fetch parts pricing: {e}")
