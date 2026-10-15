@@ -2,6 +2,8 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from ultralytics import YOLO
+import torch
+import gc
 import cv2
 import numpy as np
 import os
@@ -15,27 +17,26 @@ from dotenv import load_dotenv
 import logging
 
 # ==========================================
-# 0. ตั้งค่าระบบและ Logging
+# 0. ตั้งค่าระบบ ประหยัด RAM และ Logging
 # ==========================================
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# บังคับให้ PyTorch ใช้ 1 Thread เพื่อลดการใช้ RAM สูงสุดสำหรับ Cloud Free Tier
+torch.set_num_threads(1)
+
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-ALLOWED_ORIGINS = os.getenv(
-    "ALLOWED_ORIGINS",
-    "http://localhost:3000,http://127.0.0.1:5500,http://localhost:8000"
-).split(",")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Missing Supabase URL or Key in .env file")
+    raise ValueError("Missing SUPABASE_URL or SUPABASE_KEY in environment variables")
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 app = FastAPI(title="Car Damage Assessment API")
 
-# 1. ตั้งค่า CORS
+# 1. ตั้งค่า CORS ให้รองรับการเรียกจากทั้ง Web App และ Mobile App
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -44,14 +45,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# โหลดโมเดลด่านหน้า (Gatekeeper) สำหรับคัดกรองภาพบุคคลและวัตถุที่ไม่ใช่รถยนต์ (COCO 80 classes)
+# โหลดโมเดลด่านหน้า (Gatekeeper) และโมเดลตรวจจับความเสียหายรถยนต์
 gatekeeper_model = YOLO("yolov8n.pt")
-
-# โหลดโมเดลตรวจจับความเสียหายรถยนต์ (YOLOv8-seg + CBAM)
 model = YOLO("best.pt")
 
-CONF_THRESHOLD = 0.60       # หากต่ำกว่า 60% จะตั้งค่า needs_human_review = True เพื่อให้ช่างตรวจทาน
-MIN_INFERENCE_CONF = 0.25   # เปิดรับรอยแผลตั้งแต่ความมั่นใจ 25% ขึ้นไป (รองรับภาพย้อนแสงและรอยขีดข่วนตื้นๆ)
+CONF_THRESHOLD = 0.60       # หากต่ำกว่า 60% จะส่งเข้าคิวให้ช่างตรวจทาน (needs_human_review = True)
+MIN_INFERENCE_CONF = 0.25   # เปิดรับรอยแผลตั้งแต่ความมั่นใจ 25% ขึ้นไป (รองรับภาพย้อนแสงและรอยขีดข่วนตื้น)
 
 os.makedirs("needs_review", exist_ok=True)
 
@@ -61,7 +60,6 @@ ALLOWED_LOCATIONS = {
     "fender", "headlight", "taillight", "windshield_glass"
 }
 
-# รหัสคลาสของ COCO ที่เกี่ยวข้องกับยานพาหนะและท้องถนน
 VEHICLE_COCO_CLASSES = {2, 3, 5, 7}  # 2=car, 3=motorcycle, 5=bus, 7=truck
 
 # ==========================================
@@ -153,11 +151,19 @@ async def predict_damage(
                 detail=f"ชิ้นส่วนไม่ถูกต้อง: {invalid_locs}"
             )
 
+        # 🟢 ย่อขนาดภาพหากใหญ่เกิน 1024px เพื่อป้องกันปัญหา RAM เต็มบน Cloud Server
+        max_dim = 1024
+        if max(img.shape[:2]) > max_dim:
+            scale = max_dim / float(max(img.shape[:2]))
+            img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+
         img_h, img_w = img.shape[:2]
         img_area = float(img_h * img_w)
 
         # 🟢 ด่านที่ 1: Gatekeeper คัดกรองภาพบุคคล หุ่นจำลอง หรือวัตถุอื่นที่ไม่ใช่รถยนต์
-        gk_results = gatekeeper_model(img, conf=0.40, verbose=False)[0]
+        with torch.no_grad():
+            gk_results = gatekeeper_model(img, conf=0.40, imgsz=640, verbose=False)[0]
+
         max_person_area_ratio = 0.0
         max_vehicle_area_ratio = 0.0
         max_non_vehicle_area_ratio = 0.0
@@ -168,31 +174,30 @@ async def predict_damage(
             bh = float(b.xywh[0][3])
             area_ratio = (bw * bh) / img_area if img_area > 0 else 0.0
 
-            if cls_id == 0:  # 0 = person (คน หรือหุ่นยนต์รูปร่างคน)
+            if cls_id == 0:  # 0 = person
                 max_person_area_ratio = max(max_person_area_ratio, area_ratio)
             elif cls_id in VEHICLE_COCO_CLASSES:
                 max_vehicle_area_ratio = max(max_vehicle_area_ratio, area_ratio)
             else:
                 max_non_vehicle_area_ratio = max(max_non_vehicle_area_ratio, area_ratio)
 
-        # 1.1 บล็อกภาพที่มีบุคคลหรือหุ่นรูปร่างคนเป็นจุดเด่นโดยไม่มีรถยนต์
         if max_person_area_ratio > 0.15 and max_person_area_ratio > max_vehicle_area_ratio:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="ตรวจพบภาพบุคคลหรือหุ่นจำลอง กรุณาอัปโหลดเฉพาะภาพชิ้นส่วนรถยนต์จริง"
             )
 
-        # 1.2 บล็อกภาพสิ่งของทั่วไป/สัตว์ ที่ไม่ใช่ยานพาหนะ
         if max_non_vehicle_area_ratio > 0.25 and max_vehicle_area_ratio == 0.0:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="ตรวจพบวัตถุที่ไม่ใช่รถยนต์ กรุณาอัปโหลดเฉพาะภาพชิ้นส่วนรถยนต์จริง"
             )
 
-        # 🟢 ด่านที่ 2: รันโมเดลตรวจจับรอยแผล (เปิดรับตั้งแต่ความมั่นใจ 25% เพื่อรองรับภาพซูมใกล้และแสงจ้า)
-        results = model(img, conf=MIN_INFERENCE_CONF)[0]
+        # 🟢 ด่านที่ 2: รันโมเดลตรวจจับรอยแผลภายใต้โหมดประหยัด RAM
+        with torch.no_grad():
+            results = model(img, conf=MIN_INFERENCE_CONF, imgsz=640, verbose=False)[0]
 
-        # 🟢 ด่านที่ 3: บล็อกเฉพาะกรณีที่โมเดลไม่พบรอยแผลใดๆ เลย (0 กล่อง) และ Gatekeeper ก็ไม่เห็นรถยนต์
+        # 🟢 ด่านที่ 3: บล็อกเมื่อไม่พบรอยแผลใดๆ เลยและไม่เห็นรูปร่างรถยนต์
         if len(results.boxes) == 0 and max_vehicle_area_ratio < 0.05:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -210,7 +215,7 @@ async def predict_damage(
             for loc in locations
         }
 
-        # 🟢 Optimization A: Batch Query ดึงราคาแยกตามรุ่นรถ (civic / city)
+        # 🟢 ดึงราคากลางตามรุ่นรถ (civic / city)
         clean_car_model = car_model.strip().lower()
         try:
             pricing_res = (
@@ -244,7 +249,7 @@ async def predict_damage(
             if conf < CONF_THRESHOLD:
                 needs_human_review = True
 
-            # 🟢 Optimization C: คำนวณพื้นที่จาก Polygon Coordinates (ล็อกเพดานไม่ให้เกิน 100%)
+            # 🟢 คำนวณพื้นที่จาก Polygon Coordinates (ล็อกเพดานไม่ให้เกิน 100%)
             damage_ratio = 0.0
             if has_masks and i < len(masks.xy) and len(masks.xy[i]) > 0:
                 w = float(box.xywh[0][2])
@@ -261,7 +266,7 @@ async def predict_damage(
             matched_query = ""
             matched_loc = None
 
-            # 🟢 1. จับคู่ราคากลางจากชิ้นส่วนที่ผู้ใช้เลือกมา
+            # 1. จับคู่ราคากลางจากชิ้นส่วนที่ผู้ใช้เลือกมา
             for loc in locations:
                 if loc == "windshield_glass" and normalized_damage in ["glass_shatter", "shatter"]:
                     query = "windshield_glass_shatter"
@@ -275,14 +280,13 @@ async def predict_damage(
                     matched_query = query
                     matched_loc = loc
                     break
-                # Fallback กรณีในตารางไม่มีราคา _crack ของชิ้นส่วนนั้น ให้ใช้ราคา _dent แทน
                 elif normalized_damage == "crack" and f"{loc}_dent" in pricing_dict:
                     subtotal = pricing_dict[f"{loc}_dent"]
                     matched_query = f"{loc}_dent"
                     matched_loc = loc
                     break
 
-            # 🟢 2. Smart Fallback: กรณีผู้ใช้ลืมกดเลือกชิ้นส่วน "ไฟหน้า/ไฟท้าย" หรือ "กระจก" ตอนอัปโหลด
+            # 2. Smart Fallback กรณีผู้ใช้ไม่ได้กดเลือกชิ้นส่วนไฟหน้า/ไฟท้าย/กระจกมาแต่แรก
             if subtotal == 0.0:
                 if normalized_damage in ["glass_shatter", "shatter"] and "windshield_glass_shatter" in pricing_dict:
                     subtotal = pricing_dict["windshield_glass_shatter"]
@@ -305,7 +309,7 @@ async def predict_damage(
             if subtotal == 0.0:
                 needs_human_review = True
 
-            # 🟢 3. กำหนดวิธีซ่อมตามประเภทความเสียหายจริง (ไฟแตก/กระจกแตก/แผลเกิน 30% ต้องเปลี่ยนชิ้นส่วนเสมอ)
+            # 3. กำหนดวิธีซ่อม (ไฟแตก / กระจกแตก / แผลเกิน 30% บังคับเป็นเปลี่ยนชิ้นส่วนทันที)
             must_replace = (
                 normalized_damage in ["broken", "glass_shatter", "shatter"]
                 or damage_ratio > 0.30
@@ -363,9 +367,9 @@ async def predict_damage(
             else:
                 total_cost += summary["accumulated_cost"]
 
-        # 🟢 Optimization B: อัปโหลดรูปขึ้น Supabase Storage (พร้อม Fallback Base64)
+        # 🟢 อัปโหลดรูปขึ้น Supabase Storage (พร้อม Fallback Base64)
         img_with_boxes = results.plot()
-        _, buffer = cv2.imencode('.jpg', img_with_boxes)
+        _, buffer = cv2.imencode('.jpg', img_with_boxes, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
 
         image_filename = f"inspection_{user_id}_{uuid.uuid4().hex}.jpg"
         image_url = ""
@@ -405,6 +409,10 @@ async def predict_damage(
             save_path = f"needs_review/{image_filename}"
             cv2.imwrite(save_path, img_with_boxes)
 
+        # คืนค่าหน่วยความจำทันทีหลังประมวลผลเสร็จ
+        del gk_results, results, img, img_with_boxes, buffer
+        gc.collect()
+
         return {
             "status": "success",
             "inspection_id": inserted_id,
@@ -416,8 +424,10 @@ async def predict_damage(
         }
 
     except HTTPException:
+        gc.collect()
         raise
     except Exception as e:
+        gc.collect()
         logger.error(f"Prediction failed: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -743,4 +753,5 @@ def get_feedback_history(user_id: str):
         )
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=False)
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, reload=False)
