@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: car-damage-ai-api
+    runtime: docker
+    plan: free
+    region: singapore
+    healthCheckPath: /
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
