@@ -38,21 +38,20 @@ app = FastAPI(title="Car Damage Assessment API")
 # 1. ตั้งค่า CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # เปิดรับทุกพอร์ตสำหรับทดสอบ Flutter Web / Mobile
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# โหลดโมเดลด่านหน้า (Gatekeeper) สำหรับคัดกรองวัตถุทั่วไป (COCO 80 classes)
-# หากรันครั้งแรก Ultralytics จะดาวน์โหลดไฟล์ yolov8n.pt ขนาดประมาณ 6MB ให้อัตโนมัติ
+# โหลดโมเดลด่านหน้า (Gatekeeper) สำหรับคัดกรองภาพบุคคลและวัตถุที่ไม่ใช่รถยนต์ (COCO 80 classes)
 gatekeeper_model = YOLO("yolov8n.pt")
 
 # โหลดโมเดลตรวจจับความเสียหายรถยนต์ (YOLOv8-seg + CBAM)
 model = YOLO("best.pt")
 
-CONF_THRESHOLD = 0.60       # เกณฑ์ความมั่นใจสำหรับการส่งให้ช่างตรวจสอบ (Human-in-the-loop)
-MIN_INFERENCE_CONF = 0.50   # ตัดกรอบที่โมเดลไม่มั่นใจ (ต่ำกว่า 50%) ทิ้งทันที
+CONF_THRESHOLD = 0.60       # หากต่ำกว่า 60% จะตั้งค่า needs_human_review = True เพื่อให้ช่างตรวจทาน
+MIN_INFERENCE_CONF = 0.25   # เปิดรับรอยแผลตั้งแต่ความมั่นใจ 25% ขึ้นไป (รองรับภาพย้อนแสงและรอยขีดข่วนตื้นๆ)
 
 os.makedirs("needs_review", exist_ok=True)
 
@@ -62,13 +61,15 @@ ALLOWED_LOCATIONS = {
     "fender", "headlight", "taillight", "windshield_glass"
 }
 
+# รหัสคลาสของ COCO ที่เกี่ยวข้องกับยานพาหนะและท้องถนน
+VEHICLE_COCO_CLASSES = {2, 3, 5, 7}  # 2=car, 3=motorcycle, 5=bus, 7=truck
+
 # ==========================================
 # ฟังก์ชันตรวจสอบ Magic Bytes ของไฟล์รูปภาพ (JPEG / PNG)
 # ==========================================
 def is_valid_image_bytes(data: bytes) -> bool:
     if len(data) < 12:
         return False
-    # ตรวจสอบ Signature ของ JPEG (FF D8 FF) และ PNG (89 50 4E 47 0D 0A 1A 0A)
     is_jpeg = data.startswith(b"\xff\xd8\xff")
     is_png = data.startswith(b"\x89PNG\r\n\x1a\n")
     return is_jpeg or is_png
@@ -155,10 +156,11 @@ async def predict_damage(
         img_h, img_w = img.shape[:2]
         img_area = float(img_h * img_w)
 
-        # 🟢 ด่านที่ 1: Gatekeeper คัดกรองภาพบุคคล หุ่นจำลอง หรือวัตถุที่ไม่ใช่รถยนต์
-        gk_results = gatekeeper_model(img, conf=0.35, verbose=False)[0]
+        # 🟢 ด่านที่ 1: Gatekeeper คัดกรองภาพบุคคล หุ่นจำลอง หรือวัตถุอื่นที่ไม่ใช่รถยนต์
+        gk_results = gatekeeper_model(img, conf=0.40, verbose=False)[0]
         max_person_area_ratio = 0.0
         max_vehicle_area_ratio = 0.0
+        max_non_vehicle_area_ratio = 0.0
 
         for b in gk_results.boxes:
             cls_id = int(b.cls[0])
@@ -166,24 +168,32 @@ async def predict_damage(
             bh = float(b.xywh[0][3])
             area_ratio = (bw * bh) / img_area if img_area > 0 else 0.0
 
-            if cls_id == 0:  # 0 = person (รวมถึงคนใส่ชุดคอสเพลย์และหุ่นยนต์รูปร่างคน)
+            if cls_id == 0:  # 0 = person (คน หรือหุ่นยนต์รูปร่างคน)
                 max_person_area_ratio = max(max_person_area_ratio, area_ratio)
-            elif cls_id in [2, 5, 7]:  # 2 = car, 5 = bus, 7 = truck
+            elif cls_id in VEHICLE_COCO_CLASSES:
                 max_vehicle_area_ratio = max(max_vehicle_area_ratio, area_ratio)
+            else:
+                max_non_vehicle_area_ratio = max(max_non_vehicle_area_ratio, area_ratio)
 
-        # หากภาพมีบุคคล/หุ่นเป็นจุดเด่น (>15% ของภาพ) และใหญ่กว่ารถยนต์ในภาพ ให้ปฏิเสธทันที
+        # 1.1 บล็อกภาพที่มีบุคคลหรือหุ่นรูปร่างคนเป็นจุดเด่นโดยไม่มีรถยนต์
         if max_person_area_ratio > 0.15 and max_person_area_ratio > max_vehicle_area_ratio:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="ตรวจพบภาพบุคคลหรือหุ่นจำลอง กรุณาอัปโหลดเฉพาะภาพชิ้นส่วนรถยนต์จริง"
             )
 
-        # 🟢 ด่านที่ 2: รันโมเดลตรวจจับรอยแผลโดยตัดกรอบที่ความมั่นใจต่ำกว่า 50% ทิ้ง
+        # 1.2 บล็อกภาพสิ่งของทั่วไป/สัตว์ ที่ไม่ใช่ยานพาหนะ
+        if max_non_vehicle_area_ratio > 0.25 and max_vehicle_area_ratio == 0.0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="ตรวจพบวัตถุที่ไม่ใช่รถยนต์ กรุณาอัปโหลดเฉพาะภาพชิ้นส่วนรถยนต์จริง"
+            )
+
+        # 🟢 ด่านที่ 2: รันโมเดลตรวจจับรอยแผล (เปิดรับตั้งแต่ความมั่นใจ 25% เพื่อรองรับภาพซูมใกล้และแสงจ้า)
         results = model(img, conf=MIN_INFERENCE_CONF)[0]
 
-        # 🟢 ด่านที่ 3: หาก Gatekeeper ไม่เห็นรถยนต์เลย และโมเดลตรวจแผลก็ไม่มีจุดไหนมั่นใจเกิน 65%
-        max_damage_conf = max([float(b.conf[0]) for b in results.boxes], default=0.0)
-        if max_vehicle_area_ratio < 0.05 and max_damage_conf < 0.65:
+        # 🟢 ด่านที่ 3: บล็อกเฉพาะกรณีที่โมเดลไม่พบรอยแผลใดๆ เลย (0 กล่อง) และ Gatekeeper ก็ไม่เห็นรถยนต์
+        if len(results.boxes) == 0 and max_vehicle_area_ratio < 0.05:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="ไม่พบรถยนต์หรือความเสียหายที่ชัดเจนในภาพนี้ กรุณาถ่ายภาพชิ้นส่วนรถยนต์จริงให้ชัดเจนขึ้น"
@@ -265,6 +275,12 @@ async def predict_damage(
                     matched_query = query
                     matched_loc = loc
                     break
+                # Fallback กรณีในตารางไม่มีราคา _crack ของชิ้นส่วนนั้น ให้ใช้ราคา _dent แทน
+                elif normalized_damage == "crack" and f"{loc}_dent" in pricing_dict:
+                    subtotal = pricing_dict[f"{loc}_dent"]
+                    matched_query = f"{loc}_dent"
+                    matched_loc = loc
+                    break
 
             # 🟢 2. Smart Fallback: กรณีผู้ใช้ลืมกดเลือกชิ้นส่วน "ไฟหน้า/ไฟท้าย" หรือ "กระจก" ตอนอัปโหลด
             if subtotal == 0.0:
@@ -273,7 +289,6 @@ async def predict_damage(
                     matched_query = "windshield_glass_shatter"
                     matched_loc = "windshield_glass"
                 elif normalized_damage == "broken":
-                    # หากในรายการมีชิ้นส่วนท้ายรถ ให้คิดราคาไฟท้าย หากไม่ใช่ให้คิดราคาไฟหน้า
                     is_rear = any(r in locations for r in ["rear_bumper", "trunk", "taillight"])
                     fallback_lamp = "taillight" if is_rear else "headlight"
                     query = f"{fallback_lamp}_broken"
@@ -308,7 +323,6 @@ async def predict_damage(
             parts_detected.append(damage_info)
             current_idx = len(parts_detected) - 1
 
-            # หากเกิดจากการ Fallback ชิ้นส่วนที่ผู้ใช้ไม่ได้เลือกไว้แต่แรก ให้เพิ่มเข้า part_summary อัตโนมัติ
             if matched_loc and matched_loc not in part_summary:
                 part_summary[matched_loc] = {
                     "accumulated_cost": 0.0,
@@ -335,7 +349,6 @@ async def predict_damage(
                 is_replace = True
 
             if is_replace:
-                # หากเป็นไฟแตกหรือกระจกแตก ราคาในฐานข้อมูลคือราคาเปลี่ยนอยู่แล้ว ไม่ต้องคูณ 1.5 ซ้ำ
                 if loc in ["headlight", "taillight", "windshield_glass"] and replace_price == 0.0:
                     final_part_cost = summary["accumulated_cost"]
                 else:
@@ -535,7 +548,6 @@ async def submit_feedback(
                 detail="ราคาประเมินต้องเป็นตัวเลขเท่านั้น"
             )
 
-        # 1. บันทึก Feedback พร้อมระบุตัวตนช่าง (Audit Trail)
         feedback_data = {
             "case_id": inspection_id,
             "damage_label": damage_type,
@@ -545,7 +557,6 @@ async def submit_feedback(
         }
         supabase.table("technician_feedback").insert(feedback_data).execute()
 
-        # 2. ปลดล็อกสถานะให้ออกจากคิวเคสที่ต้องตรวจสอบ และอัปเดตราคารวมใหม่
         supabase.table("inspections").update({
             "needs_human_review": False,
             "total_cost": price_float
