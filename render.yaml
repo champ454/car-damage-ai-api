@@ -10,3 +10,4 @@ services:
         sync: false
       - key: SUPABASE_KEY
         sync: false
+
