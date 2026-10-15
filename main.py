@@ -51,6 +51,7 @@ model = YOLO("best.pt")
 
 CONF_THRESHOLD = 0.60       # หากต่ำกว่า 60% จะส่งเข้าคิวให้ช่างตรวจทาน (needs_human_review = True)
 MIN_INFERENCE_CONF = 0.25   # เปิดรับรอยแผลตั้งแต่ความมั่นใจ 25% ขึ้นไป (รองรับภาพย้อนแสงและรอยขีดข่วนตื้น)
+REPLACE_AREA_THRESHOLD = 0.30  # แผลกินพื้นที่เกิน 30% ของภาพ (ผู้ใช้ถ่ายชิ้นส่วนเต็มเฟรม) -> เปลี่ยนชิ้นส่วน
 
 os.makedirs("needs_review", exist_ok=True)
 
@@ -249,18 +250,15 @@ async def predict_damage(
             if conf < CONF_THRESHOLD:
                 needs_human_review = True
 
-            # 🟢 คำนวณพื้นที่จาก Polygon Coordinates (ล็อกเพดานไม่ให้เกิน 100%)
-            damage_ratio = 0.0
+            # 🟢 คำนวณสัดส่วนพื้นที่แผลเทียบกับ "ทั้งภาพ" (ล็อกเพดานไม่ให้เกิน 100%)
+            # เดิมหารด้วยกรอบ bbox ของแผลเอง ทำให้ได้ ~60-95% เสมอ และถูกบังคับเป็น Replace แทบทุกครั้ง
             if has_masks and i < len(masks.xy) and len(masks.xy[i]) > 0:
-                w = float(box.xywh[0][2])
-                h = float(box.xywh[0][3])
-                bbox_area = w * h
+                mask_area = float(cv2.contourArea(masks.xy[i]))
+            else:
+                # ไม่มี mask -> ใช้พื้นที่กรอบ bbox แทน
+                mask_area = float(box.xywh[0][2]) * float(box.xywh[0][3])
 
-                mask_polygon = masks.xy[i]
-                mask_area = cv2.contourArea(mask_polygon)
-
-                if bbox_area > 0:
-                    damage_ratio = min(1.0, float(mask_area / bbox_area))
+            damage_ratio = min(1.0, mask_area / img_area) if img_area > 0 else 0.0
 
             subtotal = 0.0
             matched_query = ""
@@ -309,10 +307,10 @@ async def predict_damage(
             if subtotal == 0.0:
                 needs_human_review = True
 
-            # 3. กำหนดวิธีซ่อม (ไฟแตก / กระจกแตก / แผลเกิน 30% บังคับเป็นเปลี่ยนชิ้นส่วนทันที)
+            # 3. กำหนดวิธีซ่อม (ไฟแตก / กระจกแตก / แผลเกิน 30% ของภาพ บังคับเป็นเปลี่ยนชิ้นส่วนทันที)
             must_replace = (
                 normalized_damage in ["broken", "glass_shatter", "shatter"]
-                or damage_ratio > 0.30
+                or damage_ratio > REPLACE_AREA_THRESHOLD
             )
             default_action = "เปลี่ยนชิ้นส่วน (Replace)" if must_replace else "ซ่อมทำสี (Repair)"
 
