@@ -23,8 +23,8 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# บังคับให้ PyTorch ใช้ 1 Thread เพื่อลดการใช้ RAM สูงสุดสำหรับ Cloud Free Tier
-torch.set_num_threads(1)
+# อนุญาตให้ PyTorch ใช้ 2 Threads เพื่อเพิ่มความเร็วในการประมวลผลบน Cloud CPU
+torch.set_num_threads(2)
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -151,8 +151,8 @@ async def predict_damage(
                 detail=f"ชิ้นส่วนไม่ถูกต้อง: {invalid_locs}"
             )
 
-        # 🟢 ย่อขนาดภาพหากใหญ่เกิน 1024px เพื่อป้องกันปัญหา RAM เต็มบน Cloud Server
-        max_dim = 1024
+        # 🟢 ย่อขนาดภาพให้พอดีกับโมเดล 640px เพื่อเพิ่มความเร็วในการประมวลผลสูงสุด
+        max_dim = 640
         if max(img.shape[:2]) > max_dim:
             scale = max_dim / float(max(img.shape[:2]))
             img = cv2.resize(img, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
@@ -160,9 +160,9 @@ async def predict_damage(
         img_h, img_w = img.shape[:2]
         img_area = float(img_h * img_w)
 
-        # 🟢 ด่านที่ 1: Gatekeeper คัดกรองภาพบุคคล หุ่นจำลอง หรือวัตถุอื่นที่ไม่ใช่รถยนต์
+        # 🟢 ด่านที่ 1: Gatekeeper คัดกรองภาพบุคคล หุ่นจำลอง หรือวัตถุอื่นที่ไม่ใช่รถยนต์ (ใช้ imgsz=320 เพื่อความเร็วสูง)
         with torch.no_grad():
-            gk_results = gatekeeper_model(img, conf=0.40, imgsz=640, verbose=False)[0]
+            gk_results = gatekeeper_model(img, conf=0.40, imgsz=320, verbose=False)[0]
 
         max_person_area_ratio = 0.0
         max_vehicle_area_ratio = 0.0

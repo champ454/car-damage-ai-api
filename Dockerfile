@@ -10,8 +10,8 @@ WORKDIR /app
 
 # ตั้งค่าโฟลเดอร์ชั่วคราวสำหรับ Ultralytics และจำกัดการใช้หน่วยความจำ
 ENV YOLO_CONFIG_DIR=/tmp/Ultralytics \
-    OMP_NUM_THREADS=1 \
-    MKL_NUM_THREADS=1
+    OMP_NUM_THREADS=2 \
+    MKL_NUM_THREADS=2
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
